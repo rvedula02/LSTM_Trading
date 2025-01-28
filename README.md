@@ -1,5 +1,7 @@
 # Optimizing Neural Networks for Medium-Frequency Trading in the American Stock Market
 
+By Arnav Kolli, Arjun Hegde, Rahul Vedula
+
 ## Overview
 This project investigates the application of Long Short-Term Memory (LSTM) neural networks to medium-frequency trading in the American stock market. It integrates technical indicators and employs the Adaptive Rabbit Optimization (ARO) algorithm to optimize hyperparameters. The study compares LSTM models with traditional statistical methods and alternative machine learning models, such as CNN and hybrid LSTM-CNN architectures, to highlight their advantages in capturing market dynamics and improving prediction accuracy.
 
