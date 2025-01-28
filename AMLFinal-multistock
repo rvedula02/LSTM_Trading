@@ -1,0 +1,572 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import talib as ta
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import random
+import torch.nn.functional as F
+import copy
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+class AppleDataset:
+    def __init__(self, start_date, end_date):
+        self.start_date = start_date
+        self.end_date = end_date
+        self.stock_data = None
+        self.market_data = None
+        self.scaler = None
+
+    def download_data(self):
+        """Download Apple and market data"""
+        print("Downloading data...")
+        
+        # Download Apple data
+        self.stock_data = yf.download('AAPL', start=self.start_date, end=self.end_date)
+        print("Downloaded Apple data")
+        
+        # Download S&P 500 data
+        self.market_data = yf.download('^GSPC', start=self.start_date, end=self.end_date)
+        print("Downloaded S&P 500 data")
+
+    def calculate_technical_indicators(self, data):
+        """Calculate technical indicators for a dataframe"""
+        df = data.copy()
+        
+        # Extract price and volume data and convert to numpy arrays with float64 dtype
+        close = df['Close'].values.flatten().astype(np.float64)
+        high = df['High'].values.flatten().astype(np.float64)
+        low = df['Low'].values.flatten().astype(np.float64)
+        volume = df['Volume'].values.flatten().astype(np.float64)
+
+        # Calculate indicators
+        result = pd.DataFrame(index=df.index)
+        result['Close'] = close
+        result['Returns'] = pd.Series(close, index=df.index).pct_change().values
+        result['SMA_20'] = ta.SMA(close, timeperiod=20)
+        result['SMA_50'] = ta.SMA(close, timeperiod=50)
+        
+        macd, macd_signal, macd_hist = ta.MACD(close)
+        result['MACD'] = macd
+        result['MACD_Signal'] = macd_signal
+        result['MACD_Hist'] = macd_hist
+        
+        result['RSI'] = ta.RSI(close, timeperiod=14)
+        
+        upper, middle, lower = ta.BBANDS(close, timeperiod=20)
+        result['BB_Upper'] = upper
+        result['BB_Middle'] = middle
+        result['BB_Lower'] = lower
+        result['BB_Width'] = (upper - lower) / middle
+        
+        result['OBV'] = ta.OBV(close, volume)
+        result['ATR'] = ta.ATR(high, low, close, timeperiod=14)
+        
+        return result
+
+    def prepare_data(self, sequence_length):
+        """Prepare data with both stock and market features"""
+        print("Preparing data...")
+        
+        # Calculate indicators for both stock and market
+        stock_indicators = self.calculate_technical_indicators(self.stock_data)
+        market_indicators = self.calculate_technical_indicators(self.market_data)
+        
+        # Create feature set
+        features = pd.DataFrame(index=stock_indicators.index)
+        
+        # Stock features (normalized)
+        price = stock_indicators['Close']
+        features['Returns'] = stock_indicators['Returns']
+        features['SMA_20'] = stock_indicators['SMA_20'] / price - 1
+        features['SMA_50'] = stock_indicators['SMA_50'] / price - 1
+        features['MACD'] = stock_indicators['MACD'] / price
+        features['RSI'] = stock_indicators['RSI'] / 100
+        features['BB_Width'] = stock_indicators['BB_Width']
+        features['OBV'] = stock_indicators['OBV'] / stock_indicators['OBV'].rolling(20).mean()
+        features['ATR'] = stock_indicators['ATR'] / price
+        
+        # Market features
+        features['Market_Returns'] = market_indicators['Returns']
+        features['Market_RSI'] = market_indicators['RSI'] / 100
+        features['Market_BB_Width'] = market_indicators['BB_Width']
+        features['Market_MACD'] = market_indicators['MACD'] / market_indicators['Close']
+        
+        # Remove any NaN values
+        features = features.dropna()
+        
+        # Store close prices for later use
+        self.close_prices = price[features.index]
+        
+        # Scale features
+        self.scaler = StandardScaler()
+        scaled_features = self.scaler.fit_transform(features[['Returns']])  # Only scale the Returns column
+        
+        # Create sequences
+        X, y = [], []
+        for i in range(len(scaled_features) - sequence_length):
+            X.append(scaled_features[i:i + sequence_length])
+            y.append(scaled_features[i + sequence_length])
+        
+        return np.array(X), np.array(y), features.index[sequence_length:]
+
+# Define batch size
+batch_size = 32
+
+# Define the hyperparameter search space
+search_space = {
+    'num_neurons': list(range(16, 257, 32)),  # From 16 to 256 in steps of 32
+    'num_layers': [1, 2, 3, 4],  # Multiple LSTM layers
+    'dropout_rate': [0.1, 0.2, 0.3, 0.4, 0.5],
+    'optimizer': ['Adam', 'AdamW', 'RMSprop'],
+    'learning_rate': [0.01, 0.001, 0.0001],
+    'lstm_layers': [1, 2, 3, 4]  # Number of LSTM layers
+}
+
+class HybridCNNLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, lstm_layers=1, dropout=0.2, optimizer='Adam', learning_rate=0.001):
+        super(HybridCNNLSTM, self).__init__()
+        
+        # Adjust initial CNN layers
+        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim*2, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim*2)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Multiple LSTM layers
+        self.lstm = nn.LSTM(hidden_dim*2, hidden_dim, lstm_layers, 
+                           batch_first=True, dropout=dropout if lstm_layers > 1 else 0)
+        
+        # Output layer with additional dense layers
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim//2)
+        self.fc2 = nn.Linear(hidden_dim//2, 1)
+        
+        self.optimizer = optimizer
+        self.learning_rate = learning_rate
+
+    def forward(self, x):
+        # Input shape: (batch_size, sequence_length, input_dim)
+        batch_size, seq_len, features = x.size()
+        
+        # Reshape for CNN
+        x = x.permute(0, 2, 1)  # (batch_size, input_dim, sequence_length)
+        
+        # CNN layers
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.dropout(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.dropout(x)
+        
+        # Reshape for LSTM
+        x = x.permute(0, 2, 1)  # (batch_size, sequence_length, channels)
+        
+        # LSTM layer
+        lstm_out, _ = self.lstm(x)
+        
+        # Take the last output
+        last_output = lstm_out[:, -1, :]
+        
+        # Dense layers
+        x = F.relu(self.fc1(last_output))
+        x = self.dropout(x)
+        out = self.fc2(x)
+        
+        return out
+
+class AROOptimizer:
+    def __init__(self, num_rabbits, max_iter, search_space):
+        self.num_rabbits = num_rabbits
+        self.max_iter = max_iter
+        self.search_space = search_space
+
+    def optimize(self, train_data, val_data, input_size):
+        best_score = float("inf")
+        best_params = None
+        rabbits = [self.random_params() for _ in range(self.num_rabbits)]
+        scores = [float("inf")] * self.num_rabbits
+
+        for iter in range(self.max_iter):
+            print(f"Iteration {iter+1}/{self.max_iter}")
+            for i, rabbit in enumerate(rabbits):
+                print(f"  Evaluating rabbit {i+1}/{len(rabbits)}")
+                model = HybridCNNLSTM(input_size, rabbit['hidden_dim'], rabbit['num_layers'], 
+                                    lstm_layers=rabbit['lstm_layers'], dropout=rabbit['dropout_rate'], 
+                                    optimizer=rabbit['optimizer'], 
+                                    learning_rate=rabbit['learning_rate']).to(device)
+                loss = self.train_and_evaluate(model, train_data, val_data)
+                print(f"    Validation Loss: {loss:.6f}")
+                if loss < scores[i]:
+                    scores[i] = loss
+                if loss < best_score:
+                    best_score = loss
+                    best_params = rabbit
+
+        sorted_indices = np.argsort(scores[:len(rabbits)])
+        rabbits = [rabbits[i] for i in sorted_indices]
+        scores = [scores[i] for i in sorted_indices]
+
+        # Keep the top-performing rabbits and generate new ones
+        num_keep = self.num_rabbits // 2
+        best_rabbits = rabbits[:num_keep]
+        rabbits = best_rabbits.copy()
+        scores = [float("inf")] * len(rabbits)
+
+        while len(rabbits) < self.num_rabbits:
+            parent = random.choice(best_rabbits)
+            new_rabbit = self.perturb_params(parent)
+            rabbits.append(new_rabbit)
+            scores.append(float("inf"))
+        return best_params
+
+    def random_params(self):
+        return {
+            'hidden_dim': random.choice(self.search_space['num_neurons']),
+            'num_layers': random.choice(self.search_space['num_layers']),
+            'lstm_layers': random.choice(self.search_space['lstm_layers']),
+            'dropout_rate': random.choice(self.search_space['dropout_rate']),
+            'optimizer': random.choice(self.search_space['optimizer']),
+            'learning_rate': random.choice(self.search_space['learning_rate'])
+        }
+
+    def perturb_params(self, params):
+        new_params = copy.deepcopy(params)
+        
+        # Perturb hidden_dim
+        idx = self.search_space['num_neurons'].index(new_params['hidden_dim'])
+        if random.random() < 0.5:
+            if random.random() < 0.5 and idx > 0:
+                new_params['hidden_dim'] = self.search_space['num_neurons'][idx - 1]
+            elif idx < len(self.search_space['num_neurons']) - 1:
+                new_params['hidden_dim'] = self.search_space['num_neurons'][idx + 1]
+
+        # Perturb num_layers
+        if random.random() < 0.3:
+            new_params['num_layers'] = random.choice(self.search_space['num_layers'])
+        
+        # Perturb lstm_layers
+        if random.random() < 0.3:
+            new_params['lstm_layers'] = random.choice(self.search_space['lstm_layers'])
+
+        # Perturb dropout_rate
+        idx = self.search_space['dropout_rate'].index(new_params['dropout_rate'])
+        if random.random() < 0.5:
+            if random.random() < 0.5 and idx > 0:
+                new_params['dropout_rate'] = self.search_space['dropout_rate'][idx - 1]
+            elif idx < len(self.search_space['dropout_rate']) - 1:
+                new_params['dropout_rate'] = self.search_space['dropout_rate'][idx + 1]
+
+        # Perturb optimizer
+        if random.random() < 0.1:
+            new_params['optimizer'] = random.choice(self.search_space['optimizer'])
+
+        # Perturb learning_rate
+        idx = self.search_space['learning_rate'].index(new_params['learning_rate'])
+        if random.random() < 0.5:
+            if random.random() < 0.5 and idx > 0:
+                new_params['learning_rate'] = self.search_space['learning_rate'][idx - 1]
+            elif idx < len(self.search_space['learning_rate']) - 1:
+                new_params['learning_rate'] = self.search_space['learning_rate'][idx + 1]
+
+        return new_params
+
+    def train_and_evaluate(self, model, train_data, val_data):
+        criterion = nn.MSELoss()
+        optimizer_class = getattr(torch.optim, model.optimizer)
+        optimizer = optimizer_class(model.parameters(), lr=model.learning_rate)
+        
+        model.train()
+        epochs = 10  # Adjust as needed
+        for epoch in range(epochs):
+            for X_batch, y_batch in train_data:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                optimizer.zero_grad()
+                output = model(X_batch)
+                loss = criterion(output.squeeze(), y_batch.squeeze())
+                loss.backward()
+                optimizer.step()
+                
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X, y in val_data:
+                X, y = X.to(device), y.to(device)
+                output = model(X)
+                val_loss += criterion(output.squeeze(), y.squeeze()).item()
+        return val_loss / len(val_data)
+
+def train_model(model, train_loader, val_loader, num_epochs, device):
+    criterion = nn.MSELoss()
+    optimizer_class = getattr(torch.optim, model.optimizer)
+    optimizer = optimizer_class(model.parameters(), lr=model.learning_rate)
+    
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(num_epochs):
+        model.train()
+        total_train_loss = 0
+        batch_count = 0
+        
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
+            # Forward pass
+            outputs = model(batch_X.float())
+            loss = criterion(outputs.squeeze(), batch_y.float())
+            
+            # Backward pass and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            # Add gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            total_train_loss += loss.item()
+            batch_count += 1
+            
+            # Print batch loss occasionally
+            if batch_count % 10 == 0:
+                print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{batch_count}], Loss: {loss.item():.6f}')
+        
+        # Validation
+        model.eval()
+        total_val_loss = 0
+        val_batch_count = 0
+        
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                outputs = model(batch_X.float())
+                val_loss = criterion(outputs.squeeze(), batch_y.float())
+                total_val_loss += val_loss.item()
+                val_batch_count += 1
+        
+        avg_train_loss = total_train_loss / batch_count
+        avg_val_loss = total_val_loss / val_batch_count
+        
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+        
+        print(f'Epoch [{epoch+1}/{num_epochs}], '
+              f'Train Loss: {avg_train_loss:.6f}, '
+              f'Val Loss: {avg_val_loss:.6f}')
+    
+    return train_losses, val_losses
+
+def make_predictions(model, test_loader, train_data, device, scaler, close_prices, use_predictions=False):
+    model.eval()
+    predictions = []
+    actuals = []
+    last_price = close_prices[-1]  # Get the last known price
+    
+    # Convert test_loader data to a single tensor
+    test_X = torch.cat([batch[0] for batch in test_loader], dim=0)
+    test_y = torch.cat([batch[1] for batch in test_loader], dim=0)
+    
+    with torch.no_grad():
+        current_sequence = train_data.dataset.tensors[0][-1].unsqueeze(0).to(device)
+        
+        # Iterate through each time step
+        for i in range(len(test_X)):
+            # Make prediction
+            output = model(current_sequence)
+            pred = output.cpu().numpy()
+            
+            # Convert return prediction to price
+            pred_return = scaler.inverse_transform(pred.reshape(-1, 1))[0][0]
+            pred_price = float(last_price * (1 + pred_return))  # Convert to float
+            predictions.append(pred_price)
+            
+            # Get actual value and convert to price
+            actual_return = scaler.inverse_transform(test_y[i].cpu().numpy().reshape(-1, 1))[0]
+            actual_price = float(last_price * (1 + actual_return))  # Convert to float
+            actuals.append(actual_price)
+            
+            # Update last price for next prediction
+            if use_predictions:
+                last_price = pred_price
+            else:
+                last_price = actual_price
+            
+            # Update sequence for next prediction
+            if use_predictions:
+                pred_reshaped = torch.zeros_like(current_sequence)
+                pred_reshaped[0, -1, 0] = torch.FloatTensor([pred[0][0]]).to(device)
+                current_sequence = torch.cat([
+                    current_sequence[:, 1:, :],
+                    pred_reshaped[:, -1:, :]
+                ], dim=1)
+            else:
+                current_sequence = test_X[i].unsqueeze(0).to(device)
+    
+    # Convert lists to numpy arrays, ensuring all elements are floats
+    predictions = np.array(predictions, dtype=np.float64)
+    actuals = np.array(actuals, dtype=np.float64)
+    
+    return predictions, actuals
+
+def calculate_directional_accuracy(actual_prices, predicted_prices):
+    """Calculate the directional accuracy of predictions"""
+    actual_direction = np.diff(actual_prices) > 0
+    predicted_direction = np.diff(predicted_prices) > 0
+    correct_directions = np.sum(actual_direction == predicted_direction)
+    return correct_directions / len(actual_direction) * 100
+
+def evaluate_model(model, test_loader, train_loader, device, scaler, close_prices):
+    # Make predictions using both methods
+    predictions_actual, actuals = make_predictions(model, test_loader, train_loader, device, scaler, close_prices, use_predictions=False)
+    predictions_pred, _ = make_predictions(model, test_loader, train_loader, device, scaler, close_prices, use_predictions=True)
+    
+    # Calculate metrics for both methods
+    metrics_actual = {
+        'mae': mean_absolute_error(actuals, predictions_actual),
+        'mse': mean_squared_error(actuals, predictions_actual),
+        'rmse': np.sqrt(mean_squared_error(actuals, predictions_actual)),
+        'r2': r2_score(actuals, predictions_actual),
+        'directional_accuracy': calculate_directional_accuracy(actuals, predictions_actual)
+    }
+    
+    metrics_pred = {
+        'mae': mean_absolute_error(actuals, predictions_pred),
+        'mse': mean_squared_error(actuals, predictions_pred),
+        'rmse': np.sqrt(mean_squared_error(actuals, predictions_pred)),
+        'r2': r2_score(actuals, predictions_pred),
+        'directional_accuracy': calculate_directional_accuracy(actuals, predictions_pred)
+    }
+    
+    return {
+        'actual': {
+            'metrics': metrics_actual,
+            'predictions': predictions_actual
+        },
+        'pred': {
+            'metrics': metrics_pred,
+            'predictions': predictions_pred
+        },
+        'actuals': actuals
+    }
+
+def plot_results(train_losses, val_losses, results):
+    plt.figure(figsize=(15, 10))
+    
+    # Plot training and validation losses
+    plt.subplot(2, 1, 1)
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    # Plot predictions vs actuals
+    plt.subplot(2, 1, 2)
+    plt.plot(results['actuals'], label='Actual Values', color='black')
+    plt.plot(results['actual']['predictions'], 
+             label='Predictions (Using Actual Values)', 
+             color='blue', alpha=0.7)
+    plt.plot(results['pred']['predictions'], 
+             label='Predictions (Using Prior Predictions)', 
+             color='red', alpha=0.7)
+    plt.title('Predicted vs Actual Values')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Value')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Initialize dataset
+dataset = AppleDataset(start_date='2016-01-01', end_date='2023-01-01')
+dataset.download_data()
+
+# Prepare data
+sequence_length = 20
+X, y, dates = dataset.prepare_data(sequence_length)
+
+# Split data
+train_size = int(0.7 * len(X))
+val_size = int(0.15 * len(X))
+
+X_train = X[:train_size]
+y_train = y[:train_size]
+X_val = X[train_size:train_size+val_size]
+y_val = y[train_size:train_size+val_size]
+X_test = X[train_size+val_size:]
+y_test = y[train_size+val_size:]
+test_dates = dates[train_size+val_size:]
+
+# Create data loaders for ARO optimization
+aro_train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+aro_val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+
+aro_train_loader = DataLoader(aro_train_dataset, batch_size=batch_size, shuffle=True)
+aro_val_loader = DataLoader(aro_val_dataset, batch_size=batch_size)
+
+# Create data loaders for final model training and testing
+train_dataset = TensorDataset(torch.FloatTensor(np.concatenate([X_train, X_val])), 
+                            torch.FloatTensor(np.concatenate([y_train, y_val])))
+test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size)
+
+# Initialize ARO optimizer for hyperparameter search using only train/val data
+print("Starting ARO hyperparameter optimization...")
+aro = AROOptimizer(num_rabbits=10, max_iter=5, search_space=search_space)
+best_params = aro.optimize(aro_train_loader, aro_val_loader, input_size=X.shape[2])
+
+print("\nBest Parameters found by ARO:")
+for key, value in best_params.items():
+    print(f"{key}: {value}")
+
+# Create model with best parameters
+print("\nCreating model with best parameters...")
+model = HybridCNNLSTM(
+    input_dim=X.shape[2],
+    hidden_dim=best_params['hidden_dim'],
+    num_layers=best_params['num_layers'],
+    lstm_layers=best_params['lstm_layers'],
+    dropout=best_params['dropout_rate'],
+    optimizer=best_params['optimizer'],
+    learning_rate=best_params['learning_rate']
+).to(device)
+
+# Train final model on combined train+val data
+print("\nTraining model...")
+num_epochs = 50
+train_losses, val_losses = train_model(model, train_loader, test_loader, num_epochs, device)
+
+# Evaluate model
+print("\nEvaluating model...")
+results = evaluate_model(model, test_loader, train_loader, device, dataset.scaler, dataset.close_prices)
+
+# Plot results with dates
+plot_results(train_losses, val_losses, results)
+
+print("\nFinal Results:")
+print("\nBest Parameters:")
+for key, value in best_params.items():
+    print(f"{key}: {value}")
+
+print("\nTest Metrics (Using Actual Values):")
+for key, value in results['actual']['metrics'].items():
+    print(f"{key}: {value:.4f}")
+
+print("\nTest Metrics (Using Previous Predictions):")
+for key, value in results['pred']['metrics'].items():
+    print(f"{key}: {value:.4f}")
